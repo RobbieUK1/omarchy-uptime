@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "robbie.uptime",
+  "name": "Uptime & Activity",
+  "version": "1.0.0",
+  "author": "robbie",
+  "license": "MIT",
+  "description": "Bar uptime label with an activity panel: uptime, typing and screen-time line graphs over 24 hours, 7 days and 30 days",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Uptime & Activity",
+    "description": "Shows system uptime in a selectable format. Clicking opens a panel with uptime, keyboard and screen-time graphs over the last 24 hours, 7 days and 30 days, plus format, colour and privacy settings.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

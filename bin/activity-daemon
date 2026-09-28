@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Uptime + keyboard + presence activity recorder for the bar's activity panel.
+
+Runs as a long-lived user service. Three session logs are kept in
+~/.config/omarchy/bar/data/activity-sessions.json:
+
+
+  uptime   - one entry per boot. An entry with "end": null is the boot
+             currently running; the graph renderer treats it as running up to
+             now. The daemon keeps an `alive` heartbeat so that after a reboot
+             the previous session closes at the last heartbeat before the
+             machine went down (the gap between that and the new boot is the
+             powered-off period, which is not uptime).
+  keyboard - one entry per typing burst. A burst starts at the first key press
+             after 60 seconds of silence and spans from its first press to its
+             last press; presses that happen within 60 seconds of each other
+             stay in the same burst. Keyboard time is the sum of every burst's
+             (last - first) span. The current burst is the final entry with an
+             "end" that tracks the latest press while it stays open.
+
+Keystrokes come straight off the evdev device nodes in /dev/input (readable
+through the input group), so no compositor support is needed. Every event
+device is opened and only EV_KEY presses whose key code is a "typing" key
+count — modifiers, lock keys, function keys, media/system keys and all BTN_
+codes (mouse, trackpad, pads) are excluded, so nothing else the pointer does
+ever registers as typing.
+
+  presence - how long a person has been in front of the computer. The daemon
+             grabs one small grayscale frame from the webcam every 10 seconds
+             and compares it to the previous frame; a mean-absolute-difference
+             above a small threshold counts as motion/presence. A session
+             stays open while motion is seen and closes once calm has lasted
+             PRESENCE_GRACE seconds, so short walk-aways don't split it. Frames
+             are processed in memory and never stored.
+
+The whole log is encrypted at rest with AES-256 (see activity_crypto.py);
+only timestamps are ever recorded, never the keys themselves.
+
+Keyboard and presence collection can be switched off from the panel's SHOW
+options; the daemon re-reads uptime-settings.json (showKey / showPres) every
+few seconds and stops opening input devices or grabbing camera frames for any
+series that is turned off, so that data is then not collected at all.
+
+A clear request (run `activity-daemon --clear`, as the panel's CLEAR button
+does) wipes every saved series except the boot currently running, so the
+uptime graph starts over while still counting this session.
+"""
+
+import glob
+import json
+import os
+import pathlib
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+import activity_crypto
+
+DATA_DIR = pathlib.Path.home() / ".config/omarchy/bar/data"
+ALIVE_FILE = DATA_DIR / "alive"
+CLEAR_FILE = DATA_DIR / "clear-request"
+
+SETTINGS_FILE = pathlib.Path.home() / ".config/omarchy/bar/uptime-settings.json"
+
+KEYBOARD_TIMEOUT = 60      # seconds of silence that ends a typing burst
+RETENTION_SECS = 90 * 86400  # keep ~90 days of history
+ALIVE_INTERVAL = 30        # seconds between heartbeat writes
+FLUSH_INTERVAL = 2         # seconds between state-file + live-burst writes
+RESCAN_INTERVAL = 15       # seconds between rescanning for new event devices
+FLAGS_INTERVAL = 5         # seconds between re-reading the panel's series flags
+POLL_TIMEOUT = 0.5         # select() timeout, drives all periodic work
+
+# Presence (in-front-of-computer) detection via webcam motion.
+PRESENCE_INTERVAL = 10     # seconds between camera samples
+PRESENCE_DEVICE = os.environ.get("PRESENCE_DEVICE", "/dev/video1")
+PRESENCE_MOTION_TH = 1.5   # mean absolute frame diff (0..255) counted as motion
+PRESENCE_GRACE = 120       # seconds of no motion before a session closes
+PRESENCE_BLACK = 3.0       # mean brightness below this = blank frame (skip)
+
+_EVENT = struct.Struct("qqHHi")  # timeval (2 longs) + type + code + value
+EV_KEY = 0x01
+
+PRESS = 1  # only the press edge counts once (repeat/release are ignored)
+
+# Key codes that do NOT count as typing. Everything from 1..255 not listed
+# here does (letters, digits, space, enter, punctuation, arrows, nav, KP…);
+# 256+ is the BTN_* block (mouse/touchpad/tablet), which is never typing.
+NO_TYPING = set()
+NO_TYPING.update([0, 29, 42, 56, 97, 54, 100, 125, 126, 127])   # modifiers/compose
+NO_TYPING.update([58, 69, 70])                                    # caps/num/scroll lock
+NO_TYPING.update(range(59, 69))                                   # F1..F10
+NO_TYPING.update([87, 88])                                        # F11, F12
+NO_TYPING.update(range(183, 195))                                 # F13..F24
+NO_TYPING.update([113, 114, 115, 116, 119, 142, 143, 148, 152,
+                  158, 159, 161, 163, 164, 165, 166, 167, 168,
+                  172, 173, 174, 177, 178, 179, 180, 181, 182])   # media/system
+NO_TYPING.update(range(195, 224))                                 # misc media/launch
+NO_TYPING.update(range(224, 256))                                 # brightness/system keys
+NO_TYPING.update(range(256, 0x2FF))                               # BTN_* block
+
+
+def log(msg):
+    sys.stderr.write("[activity-daemon] %s\n" % msg)
+    sys.stderr.flush()
+
+
+def atomic_write(path, payload):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def read_alive():
+    try:
+        return float(open(ALIVE_FILE).read().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def write_alive(now):
+    atomic_write(ALIVE_FILE, "%.3f\n" % now)
+
+
+def request_clear():
+    """Ask the running service to wipe recorded history (via a flag file)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(CLEAR_FILE, "please\n")
+
+
+def boot_time():
+    try:
+        with open("/proc/stat") as fh:
+            for line in fh:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def load_state():
+    data = activity_crypto.read_json({})
+    uptime = data.get("uptime", [])
+    keyboard = data.get("keyboard", [])
+    presence = data.get("presence", [])
+    if not isinstance(uptime, list):
+        uptime = []
+    if not isinstance(keyboard, list):
+        keyboard = []
+    if not isinstance(presence, list):
+        presence = []
+    return [e for e in uptime if isinstance(e, dict)], \
+           [e for e in keyboard if isinstance(e, dict)], \
+           [e for e in presence if isinstance(e, dict)]
+
+
+def save_state(uptime, keyboard, presence):
+    activity_crypto.write_json({"version": 1, "uptime": uptime,
+                                "keyboard": keyboard, "presence": presence})
+
+
+def prune(uptime, keyboard, presence, now):
+    limit = now - RETENTION_SECS
+
+    def keep(entry):
+        start = float(entry.get("start") or 0)
+        end = entry.get("end")
+        end = float(end) if end is not None else now
+        return end > limit or start >= limit
+
+    return [e for e in uptime if keep(e)], \
+           [e for e in keyboard if keep(e)], \
+           [e for e in presence if keep(e)]
+
+
+def reconcile_uptime(uptime, now):
+    """Close the previous session if we rebooted while down, then ensure an
+    open session exists for this boot."""
+    btime = boot_time()
+    if btime is None:
+        log("no btime in /proc/stat; uptime recording disabled")
+        return uptime
+    alive = read_alive()
+
+    last = uptime[-1] if uptime else None
+    if last and last.get("end") is None:
+        if abs(float(last.get("start") or 0) - btime) < 2:
+            pass  # same boot, daemon restarted: keep running
+        else:
+            # Rebooted while the daemon was down: the last boot ended at the
+            # final heartbeat before it.
+            prev_end = alive if alive > (last.get("start") or 0) else last.get("start")
+            last["end"] = round(prev_end, 3)
+            uptime.append({"start": round(btime, 3), "end": None})
+    elif not last or last.get("end") is not None:
+        uptime.append({"start": round(btime, 3), "end": None})
+
+    if uptime and uptime[-1].get("end") is None and uptime[-1]["start"] > now:
+        uptime[-1]["start"] = round(now, 3)
+    return uptime
+
+
+def reconcile_keyboard(keyboard, now):
+    """Crash recovery: close any open burst at its last recorded press."""
+    if keyboard and keyboard[-1].get("end") is None:
+        keyboard[-1]["end"] = keyboard[-1].get("last") or keyboard[-1].get("start") or now
+    return keyboard
+
+
+def reconcile_presence(presence, now):
+    """Crash recovery: close any open presence session at its last motion."""
+    if presence and presence[-1].get("end") is None:
+        presence[-1]["end"] = presence[-1].get("last") or presence[-1].get("start") or now
+    return presence
+
+
+def close_presence(presence, now):
+    """Close the open presence session (last motion, or `now` if none)."""
+    if presence and presence[-1].get("end") is None:
+        presence[-1]["end"] = round(
+            presence[-1].get("last") or presence[-1].get("start") or now, 3)
+        presence[-1].pop("last", None)
+
+
+def read_flags():
+    """(collect_keyboard, collect_presence) from the panel's SHOW options.
+
+    Either series can be switched off in the panel, in which case its data is
+    not collected at all. Missing settings (or keys) mean collect, matching a
+    fresh install."""
+    try:
+        with open(SETTINGS_FILE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    key = data.get("showKey")
+    pres = data.get("showPres")
+    return (True if key is None else bool(key)), \
+           (True if pres is None else bool(pres))
+
+
+def grab_gray():
+    """Grab one small grayscale frame (320x180 = 57600 bytes) or None."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "v4l2", "-video_size", "320x180",
+             "-i", PRESENCE_DEVICE, "-frames:v", "1", "-f", "rawvideo",
+             "-pix_fmt", "gray", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+        if out.returncode != 0:
+            return None
+        return out.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def mean_abs_diff(a, b):
+    if not a or len(a) != len(b):
+        return None
+    total = 0
+    for x, y in zip(a, b):
+        d = x - y
+        if d < 0:
+            d = -d
+        total += d
+    return total / len(a)
+
+
+def sample_presence(presence, state, now):
+    """One camera sample; state holds "pres_prev"/"pres_last"/"pres_fails"."""
+    frame = grab_gray()
+    if frame is None:
+        state["pres_fails"] += 1
+        if state["pres_fails"] % 60 == 1:
+            log("presence: camera read failed (%d in a row)" % state["pres_fails"])
+        return
+    state["pres_fails"] = 0
+    if sum(frame) / len(frame) < PRESENCE_BLACK:
+        state["pres_prev"] = None  # blank frame, no signal to compare
+        return
+
+    prev = state.get("pres_prev")
+    state["pres_prev"] = frame
+    if prev is None:
+        return  # first frame: only establishes the baseline
+
+    diff = mean_abs_diff(prev, frame)
+    present = diff is not None and diff >= PRESENCE_MOTION_TH
+
+    if present:
+        state["pres_last"] = now
+        if presence and presence[-1].get("end") is None:
+            presence[-1]["last"] = round(now, 3)
+        else:
+            presence.append({"start": round(now, 3), "last": round(now, 3)})
+    else:
+        if presence and presence[-1].get("end") is None:
+            last = float(presence[-1].get("last") or presence[-1].get("start") or now)
+            if now - last >= PRESENCE_GRACE:
+                presence[-1]["end"] = round(last, 3)
+                presence[-1].pop("last", None)
+
+
+def open_devices():
+    opened = {}
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            opened[fd] = {"path": path, "buf": b""}
+        except OSError:
+            continue
+    return opened
+
+
+def close_devices(devices):
+    for fd in list(devices):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        del devices[fd]
+
+
+def typing_key(code):
+    return 1 <= code < 0x2FF and code not in NO_TYPING
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--clear" in argv:
+        request_clear()
+        log("clear requested; robbie-activity will wipe saved activity data")
+        return
+
+    state = {"stopping": False, "alive": 0.0, "last_flush": 0.0,
+             "last_rescan": 0.0, "burst": None, "last_presence": 0.0,
+             "pres_prev": None, "pres_last": 0.0, "pres_fails": 0,
+             "last_flags": 0.0}
+
+    def handle(signum, frame):
+        state["stopping"] = True
+        if signum == signal.SIGTERM:
+            log("SIGTERM, finalizing")
+            state["alive"] = time.time()
+
+    signal.signal(signal.SIGTERM, handle)
+    signal.signal(signal.SIGINT, handle)
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    uptime, keyboard, presence = prune(*load_state(), time.time())
+    uptime = reconcile_uptime(uptime, time.time())
+    keyboard = reconcile_keyboard(keyboard, time.time())
+    presence = reconcile_presence(presence, time.time())
+    state["collect_keyboard"], state["collect_presence"] = read_flags()
+    devs = open_devices() if state["collect_keyboard"] else {}
+    log("watching %d event devices" % len(devs))
+    if not state["collect_keyboard"]:
+        log("keyboard collection disabled in settings")
+    if not state["collect_presence"]:
+        log("screen-time collection disabled in settings")
+
+    now = time.time()
+    state["alive"] = now
+    write_alive(now)
+    save_state(uptime, keyboard, presence)
+
+    def finalize_burst(burst):
+        if burst is None:
+            return
+        if keyboard and keyboard[-1].get("end") is None:
+            keyboard[-1]["end"] = round(burst["last"], 3)
+            keyboard[-1].pop("last", None)
+        else:
+            keyboard.append({"start": round(burst["start"], 3),
+                             "end": round(burst["last"], 3)})
+
+    while not state["stopping"]:
+        now = time.time()
+
+        # ---- clear request (bar/scripts/activity-daemon --clear) ----
+        if CLEAR_FILE.exists():
+            try:
+                CLEAR_FILE.unlink()
+            except OSError:
+                pass
+            running = [e for e in uptime if e.get("end") is None]
+            uptime[:] = running
+            keyboard.clear()
+            presence.clear()
+            state["burst"] = None
+            state["pres_prev"] = None
+            state["pres_last"] = 0.0
+            state["pres_fails"] = 0
+            save_state(uptime, keyboard, presence)
+            log("activity data cleared")
+
+        # ---- input events ----
+        try:
+            ready, _, _ = select.select(list(devs), [], [], POLL_TIMEOUT)
+        except (OSError, ValueError):
+            ready = []
+        for fd in ready:
+            dev = devs.get(fd)
+            if not dev:
+                continue
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                continue
+            if not chunk:
+                continue
+            dev["buf"] += chunk
+            while len(dev["buf"]) >= _EVENT.size:
+                raw, dev["buf"] = dev["buf"][:_EVENT.size], dev["buf"][_EVENT.size:]
+                _, _, etype, code, value = _EVENT.unpack(raw)
+                if etype != EV_KEY or value != PRESS:
+                    continue
+                if not typing_key(code):
+                    continue
+                t = time.time()
+                if state["burst"] is None:
+                    state["burst"] = {"start": t, "last": t}
+                elif t - state["burst"]["last"] >= KEYBOARD_TIMEOUT:
+                    finalize_burst(state["burst"])
+                    state["burst"] = {"start": t, "last": t}
+                else:
+                    state["burst"]["last"] = t
+                # The live burst is always the final keyboard entry, marked
+                # with "end": null and "last" tracking its latest press so the
+                # graph reads it even before it closes.
+                if keyboard and keyboard[-1].get("end") is None:
+                    keyboard[-1]["start"] = round(state["burst"]["start"], 3)
+                    keyboard[-1]["last"] = round(state["burst"]["last"], 3)
+                else:
+                    keyboard.append({
+                        "start": round(state["burst"]["start"], 3),
+                        "last": round(state["burst"]["last"], 3),
+                    })
+
+        # ---- periodic work ----
+        if state["burst"] is not None:
+            if now - state["burst"]["last"] >= KEYBOARD_TIMEOUT:
+                finalize_burst(state["burst"])
+                state["burst"] = None
+
+        if now - state["last_flush"] >= FLUSH_INTERVAL:
+            state["last_flush"] = now
+            save_state(uptime, keyboard, presence)
+
+        if state["collect_presence"] and now - state["last_presence"] >= PRESENCE_INTERVAL:
+            state["last_presence"] = now
+            sample_presence(presence, state, now)
+
+        if now - state["alive"] >= ALIVE_INTERVAL:
+            state["alive"] = now
+            write_alive(now)
+
+        # ---- series on/off (panel SHOW options) ----
+        if now - state["last_flags"] >= FLAGS_INTERVAL:
+            state["last_flags"] = now
+            collect_keyboard, collect_presence = read_flags()
+            if collect_keyboard != state["collect_keyboard"]:
+                state["collect_keyboard"] = collect_keyboard
+                if collect_keyboard:
+                    devs = open_devices()
+                    log("keyboard collection enabled (%d devices)" % len(devs))
+                else:
+                    if state["burst"] is not None:
+                        finalize_burst(state["burst"])
+                        state["burst"] = None
+                    close_devices(devs)
+                    devs = {}
+                    log("keyboard collection disabled")
+            if collect_presence != state["collect_presence"]:
+                state["collect_presence"] = collect_presence
+                if collect_presence:
+                    state["pres_prev"] = None
+                    state["pres_fails"] = 0
+                    log("screen-time collection enabled")
+                else:
+                    close_presence(presence, now)
+                    log("screen-time collection disabled")
+
+        if state["collect_keyboard"] and now - state["last_rescan"] >= RESCAN_INTERVAL:
+            state["last_rescan"] = now
+            existing = {dev["path"] for dev in devs.values()}
+            for path in sorted(glob.glob("/dev/input/event*")):
+                if path in existing:
+                    continue
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                    devs[fd] = {"path": path, "buf": b""}
+                    log("added %s" % path)
+                except OSError:
+                    continue
+
+    # ---- shutdown ----
+    if state["burst"] is not None:
+        finalize_burst(state["burst"])
+    close_presence(presence, time.time())
+    now = time.time()
+    write_alive(now)
+    uptime, keyboard, presence = prune(uptime, keyboard, presence, now)
+    save_state(uptime, keyboard, presence)
+    close_devices(devs)
+    log("stopped")
+
+
+if __name__ == "__main__":
+    main()

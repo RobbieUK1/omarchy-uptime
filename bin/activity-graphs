@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Bucketize activity sessions into the activity panel's graphs.
+
+Reads the sessions written by the activity-daemon
+(~/.config/omarchy/bar/data/activity-sessions.json, decrypted transparently
+via activity_crypto) and emits JSON with three rolling windows, each as a list
+of even buckets plus totals:
+
+  --metric uptime    the machine's powered-on time per bucket
+  --metric keyboard  typing time per bucket (see activity-daemon for what
+                     counts as typing and how bursts are grouped)
+  --metric presence  time a person has been in front of the computer per
+                     bucket (webcam motion, see activity-daemon)
+
+Windows:
+  24h  -> 24 one-hour buckets aligned to the hour
+  7d   -> 7 one-day buckets aligned to local midnight
+  30d  -> 30 one-day buckets aligned to local midnight
+
+The final bucket is always the partial current one. Open sessions count up to
+now, so the values tick forward live while the panel is open.
+"""
+
+import argparse
+import json
+import sys
+import time
+from datetime import datetime
+
+import activity_crypto
+
+
+def fmt_time(seconds):
+    """Compact duration: '3d 4h', '5h 30m', '45m', '0m'."""
+    secs = max(0, int(round(float(seconds))))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:
+        return "%dd %dh" % (days, hours)
+    if hours:
+        return "%dh %dm" % (hours, mins)
+    return "%dm" % mins
+
+
+def fmt_day_label(dt):
+    return dt.strftime("%a %d")
+
+
+def fmt_hour_label(dt):
+    return dt.strftime("%H:00")
+
+
+def bucketize(sessions, start, bucket_seconds, count, now):
+    """Overlap of open/closed sessions with each aligned bucket [b, b+len)."""
+    buckets = []
+    end = start
+    for i in range(count):
+        bs = start + i * bucket_seconds
+        be = bs + bucket_seconds
+        total = 0.0
+        for s, e in sessions:
+            lo = max(s, bs)
+            hi = min(e, be)
+            if hi > lo:
+                total += hi - lo
+        buckets.append({"start": int(bs), "seconds": int(round(total))})
+        end = be
+    return buckets
+
+
+def session_streams(sessions, now):
+    """Resolve each session into effective (start, end) pairs."""
+    out = []
+    for entry in sessions:
+        s = float(entry.get("start") or 0)
+        end = entry.get("end")
+        if end is None:
+            end = entry.get("last")
+        if end is None:
+            end = now
+        e = float(end)
+        if e > s:
+            out.append((s, e))
+    return out
+
+
+def make_window(start, bucket_seconds, count, now, sessions, label_fn,
+                axis_step, axis_label_fn):
+    buckets = bucketize(sessions, start, bucket_seconds, count, now)
+    total = sum(b["seconds"] for b in buckets)
+    maximum = max([b["seconds"] for b in buckets] or [0])
+    return {
+        "span": count * bucket_seconds,
+        "bucketSeconds": bucket_seconds,
+        "total": total,
+        "totalText": fmt_time(total),
+        "max": maximum if maximum > 0 else 1,
+        "buckets": buckets,
+        "axisLabels": [
+            {"at": i, "label": axis_label_fn(datetime.fromtimestamp(start + i * bucket_seconds))}
+            for i in range(0, count, axis_step)
+        ],
+    }
+
+
+def windows_for(metric, sessions, now):
+    local_midnight = datetime.now().replace(hour=0, minute=0, second=0,
+                                            microsecond=0).timestamp()
+    hour_aligned = int(now // 3600) * 3600
+    streams = session_streams(sessions, now)
+
+    w24_start = hour_aligned - 23 * 3600
+    w7_start = local_midnight - 6 * 86400
+    w30_start = local_midnight - 29 * 86400
+
+    return {
+        "24h": make_window(w24_start, 3600, 24, now, streams,
+                           fmt_hour_label, 6, fmt_hour_label),
+        "7d": make_window(w7_start, 86400, 7, now, streams,
+                          fmt_day_label, 1, fmt_day_label),
+        "30d": make_window(w30_start, 86400, 30, now, streams,
+                           fmt_day_label, 5, fmt_day_label),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--metric", required=True,
+                    choices=["uptime", "keyboard", "presence"])
+    args = ap.parse_args()
+
+    data = activity_crypto.read_json({})
+    sessions = data.get(args.metric, [])
+    if not isinstance(sessions, list):
+        sessions = []
+
+    now = time.time()
+    result = {
+        "metric": args.metric,
+        "generated": now,
+        "windows": windows_for(args.metric, sessions, now),
+    }
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

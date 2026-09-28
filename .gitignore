@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+
+# Runtime state and personal data. The activity log holds your real session
+# history and the key that decrypts it; neither belongs in git.
+data/
+activity-sessions.json
+activity.key
+alive
+uptime-settings.json
+world-times-custom.json
