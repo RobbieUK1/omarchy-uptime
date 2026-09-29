@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "robbie.uptime",
   "name": "Uptime & Activity",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "robbie",
   "license": "MIT",
   "description": "Bar uptime label with an activity panel: uptime, typing and screen-time line graphs over 24 hours, 7 days and 30 days",

@@ -121,6 +121,14 @@ an `alive` heartbeat, so after a reboot the previous session closes at its last
 heartbeat — the gap between that and the next boot is the powered-off period,
 which is correctly not counted as uptime.
 
+The daemon watches `/dev/input/event*` for typing bursts. It picks up devices
+that appear while it is running, and it closes a device as soon as it is
+removed. That matters more than it sounds: a descriptor left open after its
+device is unplugged stays readable-forever in the daemon's `select()` set, so
+the main loop never blocks again and pins a whole CPU core until the service is
+restarted. If uptime ever looks like it is costing far more CPU than it should,
+`systemctl --user status robbie-activity.service` will show it.
+
 `activity-graphs` reads and decrypts that log and prints the per-window
 aggregates the panel draws. It is called with `--metric uptime|keyboard|presence`
 and the panel polls it every 3 seconds while open.

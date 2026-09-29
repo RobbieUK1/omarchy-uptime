@@ -414,9 +414,28 @@ def main(argv=None):
                 continue
             try:
                 chunk = os.read(fd, 4096)
-            except OSError:
+            except BlockingIOError:
+                # The fd is O_NONBLOCK and select() said it was ready, but
+                # nothing actually queued. Normal race - keep the device.
                 continue
+            except OSError:
+                # A real read error means the device is gone.
+                chunk = b""
             if not chunk:
+                # EOF: the device was unplugged or its /dev node removed. The
+                # fd must be closed and dropped here. Leaving it open keeps a
+                # dead descriptor in the select() set, which select() then
+                # reports as readable on every call - so this loop never
+                # blocks again and spins a whole CPU core until the service is
+                # restarted. Keep only the ENODEV/EOF case in this branch;
+                # BlockingIOError above must not land here or a busy-but-healthy
+                # device would be dropped.
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                devs.pop(fd, None)
+                log("removed %s" % dev.get("path", "fd%d" % fd))
                 continue
             dev["buf"] += chunk
             while len(dev["buf"]) >= _EVENT.size:
